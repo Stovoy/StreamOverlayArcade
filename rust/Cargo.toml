@@ -1,0 +1,13 @@
+[package]
+name = "stream_silhouette_rust"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "stream_silhouette_rust"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+godot = { version = "0.2.2", features = ["experimental-wasm", "lazy-function-tables"] }
+nokhwa = { version = "0.10", features = ["input-native", "output-threaded"] }
+image = "0.25"
