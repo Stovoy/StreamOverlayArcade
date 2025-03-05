@@ -1,0 +1,16 @@
+[configuration]
+entry_symbol = "gdext_rust_init"
+compatibility_minimum = 4.1
+reloadable = true
+
+[libraries]
+linux.debug.x86_64 =     "res://rust/target/release/libstream_overlay_arcade_rust.so"
+linux.release.x86_64 =   "res://rust/target/release/libstream_overlay_arcade_rust.so"
+windows.debug.x86_64 =   "res://rust/target/release/stream_overlay_arcade_rust.dll"
+windows.release.x86_64 = "res://rust/target/release/stream_overlay_arcade_rust.dll"
+macos.debug =            "res://rust/target/release/libstream_overlay_arcade_rust.dylib"
+macos.release =          "res://rust/target/release/libstream_overlay_arcade_rust.dylib"
+macos.debug.arm64 =      "res://rust/target/release/libstream_overlay_arcade_rust.dylib"
+macos.release.arm64 =    "res://rust/target/release/libstream_overlay_arcade_rust.dylib"
+web.debug.wasm32 =       "res://rust/target/wasm32-unknown-emscripten/release/stream_overlay_arcade_rust.wasm"
+web.release.wasm32 =     "res://rust/target/wasm32-unknown-emscripten/release/stream_overlay_arcade_rust.wasm"

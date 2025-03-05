@@ -1,13 +1,19 @@
 [package]
-name = "stream_silhouette_rust"
+name = "stream_overlay_arcade_rust"
 version = "0.1.0"
 edition = "2021"
 
 [lib]
-name = "stream_silhouette_rust"
-crate-type = ["cdylib", "rlib"]
+name = "stream_overlay_arcade_rust"
+crate-type = ["cdylib"]
 
 [dependencies]
-godot = { version = "0.2.2", features = ["experimental-wasm", "lazy-function-tables"] }
+godot = { version = "0.2.4", features = ["experimental-wasm", "experimental-threads"] }
 nokhwa = { version = "0.10", features = ["input-native", "output-threaded"] }
 image = "0.25"
+anyhow = "1.0.76"
+ndarray = "0.15.6"
+ort = { version = "1.16.3", features = ["cuda"] }
+
+[profile.release]
+debug = true
