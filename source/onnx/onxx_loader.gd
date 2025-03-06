@@ -20,7 +20,7 @@ func _get_resource_type(path: String) -> String:
 func _handles_type(type: StringName) -> bool:
     return type == "OnnxResource"
 
-func _load(path: String, original_path: String, use_sub_threads: bool, cache_mode: int) -> Variant:
+func _load(path: String, _original_path: String, _use_sub_threads: bool, _cache_mode: int) -> Variant:
     var f = FileAccess.open(path, FileAccess.READ)
     if f == null:
         return ERR_CANT_OPEN

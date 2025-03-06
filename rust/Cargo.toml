@@ -9,7 +9,7 @@ crate-type = ["cdylib"]
 
 [dependencies]
 godot = { version = "0.2.4", features = ["experimental-wasm", "experimental-threads"] }
-nokhwa = { version = "0.10", features = ["input-native", "output-threaded"] }
+nokhwa = { version = "0.10.7", features = ["input-native", "output-threaded"] }
 image = "0.25"
 anyhow = "1.0.76"
 ndarray = "0.15.6"

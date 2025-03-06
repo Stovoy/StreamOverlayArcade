@@ -14,3 +14,7 @@ config/name="StreamOverlayArcade"
 run/main_scene="uid://d1gjdbdvjlpe3"
 config/features=PackedStringArray("4.4", "Forward Plus")
 config/icon="res://icon.svg"
+
+[physics]
+
+2d/physics_engine="Rapier2D"

@@ -12,7 +12,7 @@ use nokhwa::{
 use ort::{Environment, GraphOptimizationLevel, LoggingLevel, SessionBuilder, Value};
 use std::convert::TryFrom;
 use std::sync::Arc;
-use std::time::Instant;
+use std::panic::{self, AssertUnwindSafe};
 
 struct StreamOverlayArcadeRust;
 
@@ -77,8 +77,6 @@ impl INode for YolactSegmentation {
 impl YolactSegmentation {
     #[func]
     fn load_model(&mut self, model_path: String) -> bool {
-        godot_print!("Loading YOLACT model from: {}", model_path);
-
         let environment_result = Environment::builder()
             .with_name("yolact")
             .with_log_level(LoggingLevel::Warning)
@@ -191,7 +189,6 @@ impl YolactSegmentation {
         self.model_session = Some(Box::new(session_static));
         self.model_loaded = true;
 
-        godot_print!("YOLACT model loaded successfully with CUDA");
         true
     }
 
@@ -231,17 +228,12 @@ impl YolactSegmentation {
             let width = image.get_width();
             let height = image.get_height();
 
-            godot_print!("Processing frame with dimensions: {}x{}", width, height);
-
             let mut img_clone = image.clone();
             img_clone.convert(Format::RGB8);
             let image_data = img_clone.get_data();
 
-            godot_print!("Image data size: {}", image_data.len());
-
             match self.segment_with_yolact(image_data.as_slice(), width, height) {
                 Ok(_) => {
-                    godot_print!("YOLACT segmentation successful");
                     return true;
                 }
                 Err(e) => {
@@ -259,7 +251,6 @@ impl YolactSegmentation {
     fn set_detection_threshold(&mut self, threshold: f32) -> bool {
         if threshold >= 0.0 && threshold <= 1.0 {
             self.detection_threshold = threshold;
-            godot_print!("Detection threshold set to: {}", threshold);
             return true;
         } else {
             godot_error!("Invalid threshold value. Must be between 0.0 and 1.0");
@@ -277,8 +268,6 @@ impl YolactSegmentation {
             );
             return Err(anyhow::anyhow!("Invalid RGB data size"));
         }
-
-        let start_inference = Instant::now();
 
         let rgb_image = self.convert_to_rgb_image(rgb_data, width, height)?;
         let resized_image = image::imageops::resize(
@@ -311,12 +300,6 @@ impl YolactSegmentation {
         let inputs = vec![Value::from_array(session.allocator(), &cow_tensor)?];
         let outputs = session.run(inputs)?;
 
-        let inference_duration = start_inference.elapsed();
-        godot_print!(
-            "Inference completed in {}ms",
-            inference_duration.as_millis()
-        );
-
         if outputs.len() < 2 {
             return Err(anyhow::anyhow!("Unexpected number of outputs from model"));
         }
@@ -333,7 +316,6 @@ impl YolactSegmentation {
 
         let mask_height = mask_array.shape()[1];
         let mask_width = mask_array.shape()[2];
-        godot_print!("Mask dimensions: {}x{}", mask_width, mask_height);
 
         self.detection_scores.clear();
         self.detection_classes.clear();
@@ -359,11 +341,6 @@ impl YolactSegmentation {
                 continue;
             }
 
-            godot_print!(
-                "Found detection: class={}, score={:.2}",
-                class_id_f32 as i32,
-                score
-            );
             let class_id = class_id_f32 as i32;
 
             let x1 = (bbox_x1 * width as f32) as i32;
@@ -409,8 +386,6 @@ impl YolactSegmentation {
                 mask: cropped_mask,
             });
         }
-
-        godot_print!("Found {} valid detections", detections.len());
 
         for detection in &detections {
             self.detection_scores.push(detection.score);
@@ -708,14 +683,6 @@ impl WebCameraManager {
         for (width, height) in candidate_resolutions {
             for &fps in &candidate_fps {
                 for &frame_format in &candidate_formats {
-                    godot_print!(
-                        "Trying camera format: {}x{} @ {}fps with format {:?}",
-                        width,
-                        height,
-                        fps,
-                        frame_format
-                    );
-
                     let requested_format =
                         RequestedFormat::new::<RgbFormat>(RequestedFormatType::Closest(
                             CameraFormat::new_from(width, height, frame_format, fps),
@@ -725,15 +692,7 @@ impl WebCameraManager {
 
                     let mut camera = match camera_result {
                         Ok(cam) => cam,
-                        Err(e) => {
-                            godot_print!(
-                                "Failed to create camera with format {}x{} @ {}fps: {:?}",
-                                width,
-                                height,
-                                fps,
-                                e
-                            );
-
+                        Err(_) => {
                             continue;
                         }
                     };
@@ -823,39 +782,53 @@ impl WebCameraManager {
     }
 
     #[func]
-    fn capture_frame(&mut self) -> bool {
-        if let Some(camera) = &mut self.camera {
-            match camera.frame() {
-                Ok(frame) => match frame.decode_image::<RgbFormat>() {
-                    Ok(rgb_frame) => {
-                        let rgb_data = rgb_frame.to_vec();
-                        let width = i32::try_from(rgb_frame.width()).unwrap_or(0);
-                        let height = i32::try_from(rgb_frame.height()).unwrap_or(0);
-                        if let Some(image) = &mut self.image {
-                            let byte_array = PackedByteArray::from(rgb_data);
-                            image.set_data(width, height, false, Format::RGB8, &byte_array);
-                            if let Some(texture) = &mut self.texture {
-                                texture.update(&*image);
-                                return true;
+    fn capture_frame(&mut self) -> bool {       
+        let result = panic::catch_unwind(AssertUnwindSafe(|| {
+            if let Some(camera) = &mut self.camera {
+                match camera.frame() {
+                    Ok(frame) => match frame.decode_image::<RgbFormat>() {
+                        Ok(rgb_frame) => {
+                            let rgb_data = rgb_frame.to_vec();
+                            let width = i32::try_from(rgb_frame.width()).unwrap_or(0);
+                            let height = i32::try_from(rgb_frame.height()).unwrap_or(0);
+                            if let Some(image) = &mut self.image {
+                                let byte_array = PackedByteArray::from(rgb_data);
+                                image.set_data(width, height, false, Format::RGB8, &byte_array);
+                                if let Some(texture) = &mut self.texture {
+                                    texture.update(&*image);
+                                    return true;
+                                } else {
+                                    godot_print!("Error: Texture is None");
+                                }
                             } else {
-                                godot_print!("Error: Texture is None");
+                                godot_print!("Error: Image is None");
                             }
-                        } else {
-                            godot_print!("Error: Image is None");
                         }
-                    }
+                        Err(err) => {
+                            godot_print!("Error decoding image: {}", err);
+                        }
+                    },
                     Err(err) => {
-                        godot_print!("Error: Failed to decode RGB frame: {:?}", err);
+                        godot_print!("Error capturing frame: {}", err);
                     }
-                },
-                Err(err) => {
-                    godot_print!("Error: Failed to get frame: {:?}", err);
                 }
             }
-        } else {
-            godot_print!("Error: Camera is None");
+            false
+        }));
+        
+        match result {
+            Ok(success) => success,
+            Err(e) => {
+                if let Some(error_msg) = e.downcast_ref::<String>() {
+                    godot_print!("Panic in capture_frame: {}", error_msg);
+                } else if let Some(error_msg) = e.downcast_ref::<&str>() {
+                    godot_print!("Panic in capture_frame: {}", error_msg);
+                } else {
+                    godot_print!("Unknown panic in capture_frame");
+                }
+                false
+            }
         }
-        false
     }
 
     #[func]

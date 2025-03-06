@@ -1,6 +1,7 @@
-[gd_scene load_steps=2 format=3 uid="uid://d1gjdbdvjlpe3"]
+[gd_scene load_steps=3 format=3 uid="uid://d1gjdbdvjlpe3"]
 
 [ext_resource type="Script" uid="uid://b80syvm2yq3ps" path="res://source/camera.gd" id="1_cvpoc"]
+[ext_resource type="Script" uid="uid://dnrtddm8ep1v6" path="res://source/generator.gd" id="2_kod1s"]
 
 [node name="Camera" type="Node2D"]
 z_index = 90
@@ -9,8 +10,14 @@ script = ExtResource("1_cvpoc")
 [node name="WebCameraManager" type="WebCameraManager" parent="."]
 
 [node name="MaskDisplay" type="Sprite2D" parent="."]
+visible = false
 z_index = 1
 
 [node name="CameraDisplay" type="Sprite2D" parent="."]
 
 [node name="YolactSegmentation" type="YolactSegmentation" parent="."]
+
+[node name="PhysicsBodiesContainer" type="Node2D" parent="."]
+
+[node name="Generator" type="Node2D" parent="."]
+script = ExtResource("2_kod1s")
