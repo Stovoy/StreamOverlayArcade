@@ -15,7 +15,7 @@ z_index = 1
 
 [node name="CameraDisplay" type="Sprite2D" parent="."]
 
-[node name="YolactSegmentation" type="YolactSegmentation" parent="."]
+[node name="MediaPipeSegmentation" type="MediaPipeSegmentation" parent="."]
 
 [node name="PhysicsBodiesContainer" type="Node2D" parent="."]
 

@@ -2,47 +2,37 @@ use anyhow::Result;
 use godot::classes::image::Format;
 use godot::classes::{Image, ImageTexture, ResourceLoader};
 use godot::prelude::*;
-use image::{ImageBuffer, Rgb, RgbImage};
-use ndarray::{ArrayD, Axis, CowArray, IxDyn};
+use image::{Rgb, RgbImage};
 use nokhwa::{
     pixel_format::RgbFormat,
     utils::{CameraFormat, CameraIndex, FrameFormat, RequestedFormat, RequestedFormatType},
     Camera,
 };
-use ort::{Environment, GraphOptimizationLevel, LoggingLevel, SessionBuilder, Value};
 use std::convert::TryFrom;
 use std::sync::Arc;
 use std::panic::{self, AssertUnwindSafe};
+
+use mediapipe_rs::tasks::vision::{ImageSegmenterBuilder, ImageSegmenter};
+use tokio::runtime::Runtime as TokioRuntime;
+
+mod python_bridge;
+use python_bridge::SelfieSelfSegmentation;
 
 struct StreamOverlayArcadeRust;
 
 #[gdextension]
 unsafe impl ExtensionLibrary for StreamOverlayArcadeRust {}
 
-struct Detection {
-    bounding_box: (i32, i32, i32, i32),
-    score: f32,
-    class_id: i32,
-    mask: ImageBuffer<Rgb<u8>, Vec<u8>>,
-}
-
-impl Detection {
-    fn to_godot_rect(&self) -> Rect2i {
-        let (x1, y1, x2, y2) = self.bounding_box;
-        Rect2i::new(Vector2i::new(x1, y1), Vector2i::new(x2 - x1, y2 - y1))
-    }
-}
-
 #[derive(GodotClass)]
 #[class(base = Node)]
-struct YolactSegmentation {
+struct MediaPipeSegmentation {
     current_frame: Option<Gd<Image>>,
     output_mask: Option<Gd<Image>>,
     segmentation_masks: Vec<Gd<Image>>,
     detection_scores: Vec<f32>,
     detection_classes: Vec<i32>,
     detection_boxes: Vec<Rect2i>,
-    model_session: Option<Box<ort::InMemorySession<'static>>>,
+    runtime: Option<Arc<TokioRuntime>>,
     #[base]
     base: Base<Node>,
     model_loaded: bool,
@@ -50,46 +40,51 @@ struct YolactSegmentation {
     input_width: i32,
     input_height: i32,
     class_colors: Vec<Color>,
+    segmenter: Option<ImageSegmenter>,
+    selfie_segmentation: Option<SelfieSelfSegmentation>,
 }
 
 #[godot_api]
-impl INode for YolactSegmentation {
+impl INode for MediaPipeSegmentation {
     fn init(base: Base<Node>) -> Self {
-        Self {
+        let mut instance = Self {
+            base,
             current_frame: None,
             output_mask: None,
             segmentation_masks: Vec::new(),
             detection_scores: Vec::new(),
             detection_classes: Vec::new(),
             detection_boxes: Vec::new(),
-            model_session: None,
-            base,
+            runtime: None,
             model_loaded: false,
             detection_threshold: 0.5,
             input_width: 550,
             input_height: 550,
             class_colors: Vec::new(),
+            segmenter: None,
+            selfie_segmentation: None,
+        };
+        
+        // Try to initialize selfie segmentation
+        match SelfieSelfSegmentation::new() {
+            Ok(segmentation) => {
+                instance.selfie_segmentation = Some(segmentation);
+                godot_print!("Selfie segmentation initialized during startup");
+            }
+            Err(err) => {
+                godot_error!("Failed to initialize selfie segmentation during startup: {}", err);
+            }
         }
+        
+        instance
     }
 }
 
 #[godot_api]
-impl YolactSegmentation {
+impl MediaPipeSegmentation {
     #[func]
     fn load_model(&mut self, model_path: String) -> bool {
-        let environment_result = Environment::builder()
-            .with_name("yolact")
-            .with_log_level(LoggingLevel::Warning)
-            .build();
-
-        let environment = match environment_result {
-            Ok(env) => Arc::new(env),
-            Err(e) => {
-                godot_error!("Failed to initialize ONNX Runtime environment: {}", e);
-                return false;
-            }
-        };
-
+        // Load the model path as a resource
         let model_path_gstring: GString = model_path.into();
         let mut resource_loader = ResourceLoader::singleton();
         let resource = resource_loader.load(&model_path_gstring);
@@ -105,9 +100,9 @@ impl YolactSegmentation {
             }
         };
 
+        // Setup class colors
         self.class_colors = vec![];
-
-        for i in 0..81 {
+        for i in 0..256 {
             let hue = (i * 7) % 360;
             let h = hue as f32 / 360.0;
             let s = 0.7;
@@ -134,9 +129,9 @@ impl YolactSegmentation {
             let color = Color::from_rgb(r + m, g + m, b + m);
             self.class_colors.push(color);
         }
-
         self.class_colors.push(Color::from_rgb(1.0, 0.0, 1.0));
 
+        // Get model data as bytes
         let model_data = {
             let data_variant = model_resource.get("data");
             match data_variant.try_to::<PackedByteArray>() {
@@ -148,48 +143,35 @@ impl YolactSegmentation {
             }
         };
 
-        let session_builder = match SessionBuilder::new(&environment) {
-            Ok(builder) => builder,
-            Err(e) => {
-                godot_error!("Failed to create session builder: {}", e);
-                return false;
-            }
-        };
-
-        let session_builder =
-            match session_builder.with_optimization_level(GraphOptimizationLevel::Level3) {
-                Ok(builder) => builder,
+        // Create a tokio runtime for async operations
+        let tokio_runtime = match tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build() {
+                Ok(rt) => rt,
                 Err(e) => {
-                    godot_error!("Failed to set optimization level: {}", e);
+                    godot_error!("Failed to create tokio runtime: {}", e);
                     return false;
                 }
             };
-
-        let execution_providers = vec![ort::ExecutionProvider::CUDA(Default::default())];
-
-        let session_builder = match session_builder.with_execution_providers(&execution_providers) {
-            Ok(builder) => builder,
+            
+        self.runtime = Some(Arc::new(tokio_runtime));
+        
+        // Initialize MediaPipe segmenter
+        match ImageSegmenterBuilder::new()
+            .output_category_mask(true)
+            .output_confidence_masks(true)
+            .build_from_buffer(&model_data) {
+            Ok(segmenter) => {
+                self.segmenter = Some(segmenter);
+                self.model_loaded = true;
+                godot_print!("MediaPipe segmenter loaded successfully");
+                true
+            },
             Err(e) => {
-                godot_error!("Failed to set CUDA execution provider: {}", e);
-                return false;
+                godot_error!("Failed to build MediaPipe segmenter: {}", e);
+                false
             }
-        };
-
-        let session_result = session_builder.with_model_from_memory(&model_data);
-        let session = match session_result {
-            Ok(session) => session,
-            Err(e) => {
-                godot_error!("Failed to load model: {}", e);
-                return false;
-            }
-        };
-
-        let session_static = unsafe { std::mem::transmute(session) };
-
-        self.model_session = Some(Box::new(session_static));
-        self.model_loaded = true;
-
-        true
+        }
     }
 
     #[func]
@@ -232,7 +214,7 @@ impl YolactSegmentation {
             img_clone.convert(Format::RGB8);
             let image_data = img_clone.get_data();
 
-            match self.segment_with_yolact(image_data.as_slice(), width, height) {
+            match self.segment_with_mediapipe(image_data.as_slice(), width, height) {
                 Ok(_) => {
                     return true;
                 }
@@ -258,7 +240,7 @@ impl YolactSegmentation {
         }
     }
 
-    fn segment_with_yolact(&mut self, rgb_data: &[u8], width: i32, height: i32) -> Result<()> {
+    fn segment_with_mediapipe(&mut self, rgb_data: &[u8], width: i32, height: i32) -> Result<()> {
         let expected_size = (width * height * 3) as usize;
         if rgb_data.len() != expected_size {
             godot_error!(
@@ -269,170 +251,76 @@ impl YolactSegmentation {
             return Err(anyhow::anyhow!("Invalid RGB data size"));
         }
 
+        // Check if the segmenter is available
+        if self.segmenter.is_none() {
+            return Err(anyhow::anyhow!("MediaPipe segmenter not initialized"));
+        }
+
+        // Convert image data to RGB image
         let rgb_image = self.convert_to_rgb_image(rgb_data, width, height)?;
-        let resized_image = image::imageops::resize(
-            &rgb_image,
-            self.input_width as u32,
-            self.input_height as u32,
-            image::imageops::FilterType::Triangle,
-        );
-
-        let mut input_tensor_data =
-            Vec::with_capacity((self.input_width * self.input_height * 3) as usize);
-
-        for channel in [2, 1, 0] {
-            for row in 0..self.input_height as usize {
-                for col in 0..self.input_width as usize {
-                    let pixel = resized_image.get_pixel(col as u32, row as u32);
-                    input_tensor_data.push(pixel[channel] as f32);
-                }
-            }
-        }
-
-        let input_shape = vec![1, 3, self.input_height as usize, self.input_width as usize];
-        let input_tensor = ArrayD::from_shape_vec(IxDyn(&input_shape), input_tensor_data)?;
-        let cow_tensor = CowArray::from(input_tensor);
-
-        let session = self
-            .model_session
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("Model session not initialized"))?;
-        let inputs = vec![Value::from_array(session.allocator(), &cow_tensor)?];
-        let outputs = session.run(inputs)?;
-
-        if outputs.len() < 2 {
-            return Err(anyhow::anyhow!("Unexpected number of outputs from model"));
-        }
-
-        let detection_output = &outputs[0];
-        let mask_output = &outputs[1];
-
-        let detection_extracted = detection_output.try_extract::<f32>()?;
-        let detection_view = detection_extracted.view();
-        let detection_array = detection_view.index_axis(Axis(0), 0);
-
-        let mask_extracted = mask_output.try_extract::<f32>()?;
-        let mask_array = mask_extracted.view();
-
-        let mask_height = mask_array.shape()[1];
-        let mask_width = mask_array.shape()[2];
-
+        
+        // Process image with MediaPipe
+        let segment_result = self.segmenter.as_mut().unwrap().segment(&rgb_image)?;
+        
+        // Clear previous detections
         self.detection_scores.clear();
         self.detection_classes.clear();
         self.detection_boxes.clear();
         self.segmentation_masks.clear();
-
-        let mut detections: Vec<Detection> = Vec::new();
-
-        for (detection_index, detection_row) in detection_array.outer_iter().enumerate() {
-            if detection_index >= mask_array.shape()[0] {
-                godot_print!("Warning: Detection index exceeds mask array dimension");
-                break;
-            }
-
-            let bbox_x1 = detection_row[0];
-            let bbox_y1 = detection_row[1];
-            let bbox_x2 = detection_row[2];
-            let bbox_y2 = detection_row[3];
-            let score = detection_row[4];
-            let class_id_f32 = detection_row[5];
-
-            if score < self.detection_threshold {
-                continue;
-            }
-
-            let class_id = class_id_f32 as i32;
-
-            let x1 = (bbox_x1 * width as f32) as i32;
-            let y1 = (bbox_y1 * height as f32) as i32;
-            let x2 = (bbox_x2 * width as f32) as i32;
-            let y2 = (bbox_y2 * height as f32) as i32;
-
-            let mut detection_mask = RgbImage::new(mask_width as u32, mask_height as u32);
-            for row in 0..mask_height {
-                for col in 0..mask_width {
-                    let mask_value = mask_array[[detection_index, row, col]];
-                    if mask_value > 0.5 {
-                        detection_mask.put_pixel(
-                            col as u32,
-                            row as u32,
-                            Rgb([(class_id + 1) as u8, 0, 0]),
-                        );
-                    }
-                }
-            }
-
-            let crop_x1 = ((bbox_x1 * mask_width as f32).max(0.0)) as u32;
-            let crop_y1 = ((bbox_y1 * mask_height as f32).max(0.0)) as u32;
-            let crop_x2 = ((bbox_x2 * mask_width as f32).max(0.0)) as u32;
-            let crop_y2 = ((bbox_y2 * mask_height as f32).max(0.0)) as u32;
-
-            let mut cropped_mask = RgbImage::new(mask_width as u32, mask_height as u32);
-            if crop_x2 > crop_x1 && crop_y2 > crop_y1 {
-                for y in crop_y1..crop_y2 {
-                    for x in crop_x1..crop_x2 {
-                        if y < mask_height as u32 && x < mask_width as u32 {
-                            let pixel = detection_mask.get_pixel(x, y);
-                            cropped_mask.put_pixel(x, y, *pixel);
-                        }
-                    }
-                }
-            }
-
-            detections.push(Detection {
-                bounding_box: (x1, y1, x2, y2),
-                score,
-                class_id,
-                mask: cropped_mask,
-            });
-        }
-
-        for detection in &detections {
-            self.detection_scores.push(detection.score);
-            self.detection_classes.push(detection.class_id);
-            self.detection_boxes.push(detection.to_godot_rect());
-        }
-
-        let mut combined_mask = RgbImage::new(mask_width as u32, mask_height as u32);
-        for detection in &detections {
-            let class_id = detection.class_id;
-
-            let color = if class_id >= 0 && class_id < self.class_colors.len() as i32 {
-                &self.class_colors[class_id as usize]
-            } else {
-                &self.class_colors[self.class_colors.len() - 1]
-            };
-
-            let rgb_color = Rgb([
-                (color.r * 255.0) as u8,
-                (color.g * 255.0) as u8,
-                (color.b * 255.0) as u8,
-            ]);
-
+        
+        // Process the category mask if available
+        if let Some(category_mask) = &segment_result.category_mask {
+            // Get dimensions
+            let mask_width = i32::try_from(category_mask.width()).unwrap_or(width);
+            let mask_height = i32::try_from(category_mask.height()).unwrap_or(height);
+            
+            // Create an RGB mask image
+            let mut mask_image = RgbImage::new(mask_width as u32, mask_height as u32);
+            
+            // Process each segment in the mask
             for y in 0..mask_height as u32 {
                 for x in 0..mask_width as u32 {
-                    let mask_pixel = detection.mask.get_pixel(x, y)[0];
-                    if mask_pixel != 0 {
-                        combined_mask.put_pixel(x, y, rgb_color);
+                    // Access the pixel directly - get_pixel returns a Luma<u8>
+                    let pixel = category_mask.get_pixel(x, y);
+                    let category = pixel[0]; // Get the u8 value from the Luma
+                    
+                    if category > 0 {
+                        // Use category value to look up the color
+                        let color_idx = category as usize % self.class_colors.len();
+                        let color = &self.class_colors[color_idx];
+                        
+                        let r = (color.r * 255.0) as u8;
+                        let g = (color.g * 255.0) as u8;
+                        let b = (color.b * 255.0) as u8;
+                        
+                        mask_image.put_pixel(x, y, Rgb([r, g, b]));
+                    } else {
+                        // Background
+                        mask_image.put_pixel(x, y, Rgb([0, 0, 0]));
                     }
                 }
             }
+            
+            // Create Godot image from mask
+            if let Ok(godot_mask) = self.create_single_godot_mask(&mask_image, mask_width, mask_height) {
+                self.segmentation_masks.push(godot_mask.clone());
+                
+                // Set combined mask
+                self.output_mask = Some(godot_mask);
+                
+                // Create detection info
+                self.detection_scores.push(1.0); // MediaPipe doesn't provide scores per category
+                self.detection_classes.push(1);  // Default class for now
+                
+                // Create bounding box (full image for now - could be calculated from mask)
+                let rect = Rect2i::new(
+                    Vector2i::new(0, 0),
+                    Vector2i::new(width, height)
+                );
+                self.detection_boxes.push(rect);
+            }
         }
-
-        let resized_mask = image::imageops::resize(
-            &combined_mask,
-            width as u32,
-            height as u32,
-            image::imageops::FilterType::Nearest,
-        );
-
-        self.create_godot_mask_from_image(&resized_mask, width, height)?;
-
-        for detection in &detections {
-            let mask_image = self.create_single_godot_mask(&detection.mask, width, height)?;
-            self.segmentation_masks.push(mask_image);
-        }
-
+        
         Ok(())
     }
 
@@ -505,13 +393,6 @@ impl YolactSegmentation {
         width: i32,
         height: i32,
     ) -> Result<Gd<Image>> {
-        let resized_mask = image::imageops::resize(
-            mask,
-            width as u32,
-            height as u32,
-            image::imageops::FilterType::Nearest,
-        );
-
         let mut godot_mask = match Image::create(width, height, false, Format::RGBA8) {
             Some(img) => img,
             None => {
@@ -524,19 +405,21 @@ impl YolactSegmentation {
 
         for y in 0..height as u32 {
             for x in 0..width as u32 {
-                let pixel = resized_mask.get_pixel(x, y);
-                let index = ((y as i32 * width + x as i32) * 4) as usize;
+                if x < mask.width() && y < mask.height() {
+                    let pixel = mask.get_pixel(x, y);
+                    let index = ((y as i32 * width + x as i32) * 4) as usize;
 
-                let alpha = if pixel[0] > 0 || pixel[1] > 0 || pixel[2] > 0 {
-                    128
-                } else {
-                    0
-                };
+                    let alpha = if pixel[0] > 0 || pixel[1] > 0 || pixel[2] > 0 {
+                        128
+                    } else {
+                        0
+                    };
 
-                byte_array[index] = pixel[0];
-                byte_array[index + 1] = pixel[1];
-                byte_array[index + 2] = pixel[2];
-                byte_array[index + 3] = alpha;
+                    byte_array[index] = pixel[0];
+                    byte_array[index + 1] = pixel[1];
+                    byte_array[index + 2] = pixel[2];
+                    byte_array[index + 3] = alpha;
+                }
             }
         }
 
@@ -616,6 +499,58 @@ impl YolactSegmentation {
         }
 
         dict
+    }
+
+    #[func]
+    fn init_selfie_segmentation(&mut self) -> bool {
+        match SelfieSelfSegmentation::new() {
+            Ok(segmentation) => {
+                self.selfie_segmentation = Some(segmentation);
+                godot_print!("Selfie segmentation initialized successfully");
+                true
+            }
+            Err(err) => {
+                godot_error!("Failed to initialize selfie segmentation: {}", err);
+                false
+            }
+        }
+    }
+
+    #[func]
+    fn process_image_with_python(&mut self, image: Gd<Image>) -> Gd<Image> {
+        let selfie_segmentation = match &self.selfie_segmentation {
+            Some(segmentation) => segmentation,
+            None => {
+                godot_error!("Selfie segmentation not initialized");
+                return Image::new().upcast();
+            }
+        };
+
+        // Get image data
+        let mut image_ref = image.bind();
+        image_ref.convert(Format::FORMAT_RGB8);
+        
+        // Resize to 256x256 if needed
+        if image_ref.get_width() != 256 || image_ref.get_height() != 256 {
+            image_ref.resize(256, 256, Image::INTERPOLATE_BILINEAR);
+        }
+        
+        let image_data = image_ref.get_data();
+        
+        // Process the image
+        let mask_data = match selfie_segmentation.process_image(&image_data) {
+            Ok(data) => data,
+            Err(err) => {
+                godot_error!("Failed to process image: {}", err);
+                return Image::new().upcast();
+            }
+        };
+        
+        // Create a new image from the mask data
+        let mut mask_image = Image::new();
+        mask_image.set_data(256, 256, false, Format::FORMAT_L8, PackedByteArray::from(mask_data));
+        
+        mask_image.upcast()
     }
 }
 

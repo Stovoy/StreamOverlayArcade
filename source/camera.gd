@@ -3,7 +3,7 @@ extends Node2D
 @onready var web_camera_manager = $WebCameraManager
 @onready var camera_display = $CameraDisplay
 @onready var mask_display = $MaskDisplay
-@onready var segmentation = $YolactSegmentation
+@onready var segmentation = $MediaPipeSegmentation
 @onready var physics_bodies_container = $PhysicsBodiesContainer
 
 var viewport_size: Vector2
@@ -48,8 +48,13 @@ func _ready() -> void:
     viewport_size = get_viewport_rect().size
     get_viewport().size_changed.connect(_on_viewport_size_changed)
     
-    if not segmentation.load_model("res://models/yolact_edge_mobilenetv2_550x550.onnx"):
-        print("Failed to load segmentation model")
+    var model_path = "res://models/selfie_segmenter.tflite"
+    print("Loading model from: " + model_path)
+    
+    if not segmentation.load_model(model_path):
+        print("Failed to load segmentation model: " + model_path)
+    else:
+        print("Model loaded successfully!")
     
     initialized = true
 
