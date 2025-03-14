@@ -10,7 +10,6 @@ script = ExtResource("1_cvpoc")
 [node name="WebCameraManager" type="WebCameraManager" parent="."]
 
 [node name="MaskDisplay" type="Sprite2D" parent="."]
-visible = false
 z_index = 1
 
 [node name="CameraDisplay" type="Sprite2D" parent="."]

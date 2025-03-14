@@ -4,3 +4,6 @@
 rust/target
 yolact_edge_demo/
 .vscode/
+*.tmp
+addons/godot-rapier2d/bin/~libgodot_rapier.windows.x86_64-pc-windows-msvc.dll
+__pycache__/

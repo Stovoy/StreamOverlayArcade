@@ -11,7 +11,6 @@ var frame_count: int = 0
 var last_time: float = 0.0
 var current_fps: float = 0.0
 
-var detection_boxes = []
 var detection_labels = []
 var physics_bodies = []
 
@@ -23,23 +22,6 @@ var min_capture_interval_ms: int = 100
 var last_capture_time: int = 0
 var initialized: bool = false
 
-var coco_classes = [
-    "person", "bicycle", "car", "motorcycle", "airplane", "bus",
-    "train", "truck", "boat", "traffic light", "fire hydrant",
-    "stop sign", "parking meter", "bench", "bird", "cat", "dog",
-    "horse", "sheep", "cow", "elephant", "bear", "zebra", "giraffe",
-    "backpack", "umbrella", "handbag", "tie", "suitcase", "frisbee",
-    "skis", "snowboard", "sports ball", "kite", "baseball bat",
-    "baseball glove", "skateboard", "surfboard", "tennis racket",
-    "bottle", "wine glass", "cup", "fork", "knife", "spoon", "bowl",
-    "banana", "apple", "sandwich", "orange", "broccoli", "carrot",
-    "hot dog", "pizza", "donut", "cake", "chair", "couch",
-    "potted plant", "bed", "dining table", "toilet", "tv", "laptop",
-    "mouse", "remote", "keyboard", "cell phone", "microwave", "oven",
-    "toaster", "sink", "refrigerator", "book", "clock", "vase",
-    "scissors", "teddy bear", "hair drier", "toothbrush"
-]
-
 func _ready() -> void:
     if not web_camera_manager.start_camera():
         print("Failed to start camera")
@@ -47,14 +29,6 @@ func _ready() -> void:
     
     viewport_size = get_viewport_rect().size
     get_viewport().size_changed.connect(_on_viewport_size_changed)
-    
-    var model_path = "res://models/selfie_segmenter.tflite"
-    print("Loading model from: " + model_path)
-    
-    if not segmentation.load_model(model_path):
-        print("Failed to load segmentation model: " + model_path)
-    else:
-        print("Model loaded successfully!")
     
     initialized = true
 
@@ -97,46 +71,49 @@ func _process(_delta: float) -> void:
 
 func _inference_thread_function(frame: Image) -> void:
     var result = process_image_in_thread(frame)
-    # Use call_deferred to safely return to main thread without blocking
     call_deferred("_on_inference_complete", result)
 
 func _on_inference_complete(result: Dictionary) -> void:
     latest_inference_result = result
     is_inference_running = false
-    inference_thread.wait_to_finish()
-    inference_thread = null
+    if inference_thread:
+        inference_thread.wait_to_finish()
+        inference_thread = null
 
 func process_image_in_thread(image: Image) -> Dictionary:
     if not segmentation or not segmentation.is_ready():
         return {"success": false}
     
+    # Pass the frame directly to the segmentation module
     segmentation.set_current_frame(image)
-    var result = segmentation.process_all_objects()
     
-    if result:
-        var mask_image = segmentation.get_combined_mask()
-        var detection_count = segmentation.get_detection_count()
-        var boxes = segmentation.get_detection_boxes()
-        var scores = segmentation.get_detection_scores()
-        var classes = segmentation.get_detection_classes()
+    # Get all results in a single call
+    var result_dict = segmentation.process_segmentation()
+    
+    if result_dict.size() > 0:
+        # The mask image is directly in the result dictionary
+        var mask_image = result_dict.get("mask")
         
-        # Get individual masks for each detection
-        var segmentation_masks = []
+        # Get detections array from the result
+        var detections = result_dict.get("detections", [])
+        var detection_count = detections.size()
+        
+        # Extract scores and classes from detections
+        var scores = PackedFloat32Array()
+        var classes = PackedInt32Array()
+        
         for i in range(detection_count):
-            var detection_dict = segmentation.get_detection_at_index(i)
-            if detection_dict.has("mask"):
-                segmentation_masks.append(detection_dict["mask"])
-            else:
-                segmentation_masks.append(null)
-        
+            var detection = detections[i]
+            scores.append(detection.get("score", 1.0))
+            classes.append(detection.get("class_id", 0))
+            
         return {
             "success": true,
-            "mask_image": mask_image.duplicate(),
+            "mask_image": mask_image.duplicate() if mask_image else null,
             "detection_count": detection_count,
-            "boxes": boxes.duplicate(),
-            "scores": scores.duplicate(),
-            "classes": classes.duplicate(),
-            "segmentation_masks": segmentation_masks
+            "scores": scores,
+            "classes": classes,
+            "detections": detections
         }
     
     return {"success": false}
@@ -145,7 +122,6 @@ func update_detection_results(results: Dictionary) -> void:
     if not results.has("success") or not results["success"]:
         return
     
-    detection_boxes.clear()
     detection_labels.clear()
     
     # Clear existing physics bodies
@@ -158,43 +134,44 @@ func update_detection_results(results: Dictionary) -> void:
         child.queue_free()
     
     var mask_image = results["mask_image"]
-    if mask_image:
-        var mask_texture = ImageTexture.create_from_image(mask_image)
-        if mask_texture:
-            mask_display.texture = mask_texture
-            
-            if mask_display.z_index <= camera_display.z_index:
-                mask_display.z_index = camera_display.z_index + 1
-        
-        var detection_count = results["detection_count"]
-        
-        var boxes = results["boxes"]
-        var scores = results["scores"]
-        var classes = results["classes"]
-        var segmentation_masks = results.get("segmentation_masks", [])
-        
-        for i in range(detection_count):
-            if i < boxes.size():
-                detection_boxes.append(boxes[i])
-                
-                var label_info = {
-                    "class_id": classes[i],
-                    "class_name": get_class_name(classes[i]),
-                    "score": scores[i]
-                }
-                detection_labels.append(label_info)
-                
-                # Create physics body from mask only for person class (class_id 0)
-                if i < segmentation_masks.size() and segmentation_masks[i] != null and classes[i] == 0:
-                    create_physics_body_from_mask(segmentation_masks[i], boxes[i], classes[i])
-    else:
+    if not mask_image:
         print("No valid mask was returned")
+        return
 
-func create_physics_body_from_mask(mask_image: Image, box: Rect2, class_id: int) -> void:
+    var detection_count = results["detection_count"]
+    var scores = results["scores"]
+    var classes = results["classes"]
+    var segmentation_masks = results.get("segmentation_masks", [])
+    var detections = results.get("detections", [])
+    
+    var mask_texture = ImageTexture.create_from_image(mask_image)
+    mask_display.texture = mask_texture
+    
+    if mask_display.z_index <= camera_display.z_index:
+        mask_display.z_index = camera_display.z_index + 1
+    
+    for i in range(detection_count):
+        var detection = detections[i]
+        var class_id = detection.get("class_id", 0)
+        var _class_name = detection.get("class_name", str(class_id))
+        var score = detection.get("score", 1.0)
+        var color = detection.get("color", Color(1, 0, 0))
+        
+        var label_info = {
+            "class_id": class_id,
+            "class_name": _class_name,
+            "score": score,
+            "color": color
+        }
+        detection_labels.append(label_info)
+        
+        if class_id == 15:
+            create_physics_body_from_mask(mask_image, class_id, color)
+
+func create_physics_body_from_mask(mask_image: Image, class_id: int, color: Color = Color(1, 0, 0)) -> void:
     var static_body = StaticBody2D.new()
     static_body.position = camera_display.position
-    var color = segmentation.get_class_color(class_id)
-    var collision_polygon = create_collision_polygon_from_mask(mask_image, box)
+    var collision_polygon = create_collision_polygon_from_mask(mask_image, color)
     
     if collision_polygon:
         for i in range(collision_polygon.polygon.size()):
@@ -221,6 +198,206 @@ func create_physics_body_from_mask(mask_image: Image, box: Rect2, class_id: int)
         
         # Immediately check for and push out any existing overlapping bodies
         call_deferred("_check_overlapping_bodies", area)
+
+func create_collision_polygon_from_mask(mask_image: Image, color: Color = Color(1, 0, 0), downsample_factor: float = 4.0) -> CollisionPolygon2D:
+    var new_width = max(1, int(mask_image.get_width() / downsample_factor))
+    var new_height = max(1, int(mask_image.get_height() / downsample_factor))
+    mask_image.resize(new_width, new_height, Image.INTERPOLATE_NEAREST)
+    
+    for y in range(new_height):
+        for x in range(new_width):
+            var pixel = mask_image.get_pixel(x, y)
+            if pixel.a > 0:
+                pixel.a = 1
+            if pixel == color:
+                mask_image.set_pixel(x, y, Color(1, 1, 1))
+            else:
+                mask_image.set_pixel(x, y, Color(0, 0, 0))
+    
+    var all_polygons = marching_squares(mask_image)
+    if all_polygons.size() == 0:
+        return CollisionPolygon2D.new()
+    
+    var biggest_polygon = all_polygons[0]
+    var biggest_area = get_polygon_area(biggest_polygon)
+    for polygon in all_polygons:
+        var area = get_polygon_area(polygon)
+        if area > biggest_area:
+            biggest_polygon = polygon
+            biggest_area = area
+    
+    var simplified = simplify_polygon(biggest_polygon, 2.0)
+    for i in range(simplified.size()):
+        simplified[i] *= downsample_factor
+    
+    var collision_polygon = CollisionPolygon2D.new()
+    collision_polygon.polygon = simplified
+    return collision_polygon
+
+func marching_squares(src_image: Image) -> Array:
+    var width = src_image.get_width()
+    var height = src_image.get_height()
+    var data = []
+    
+    for y in range(height):
+        var row = []
+        for x in range(width):
+            var value = src_image.get_pixel(x, y).r
+            row.append(1 if value > 0 else 0)
+        data.append(row)
+    
+    var edges = []
+    for y in range(height - 1):
+        for x in range(width - 1):
+            var v0 = data[y][x]
+            var v1 = data[y][x + 1]
+            var v2 = data[y + 1][x + 1]
+            var v3 = data[y + 1][x]
+            var cell_index = v0*1 + v1*2 + v2*4 + v3*8
+            var cell_edges = get_marching_square_edges(x, y, v0, v1, v2, v3)
+            for edge in cell_edges:
+                edges.append(edge)
+    
+    var polygons = assemble_polygons(edges)
+    return polygons
+
+func get_marching_square_edges(x: int, y: int, v0: int, v1: int, v2: int, v3: int) -> Array:
+    var cell_index = v0*1 + v1*2 + v2*4 + v3*8
+    match cell_index:
+        0, 15: return []
+        1: return [[Vector2(x, y+0.5), Vector2(x+0.5, y)]]
+        2: return [[Vector2(x+0.5, y), Vector2(x+1, y+0.5)]]
+        3: return [[Vector2(x, y+0.5), Vector2(x+1, y+0.5)]]
+        4: return [[Vector2(x+1, y+0.5), Vector2(x+0.5, y+1)]]
+        5: return [
+            [Vector2(x, y+0.5), Vector2(x+0.5, y)],
+            [Vector2(x+1, y+0.5), Vector2(x+0.5, y+1)]
+        ]
+        6: return [[Vector2(x+0.5, y), Vector2(x+0.5, y+1)]]
+        7: return [[Vector2(x, y+0.5), Vector2(x+0.5, y+1)]]
+        8: return [[Vector2(x+0.5, y+1), Vector2(x, y+0.5)]]
+        9: return [[Vector2(x+0.5, y), Vector2(x+0.5, y+1)]]
+        10: return [
+            [Vector2(x+0.5, y), Vector2(x+1, y+0.5)],
+            [Vector2(x+0.5, y+1), Vector2(x, y+0.5)]
+        ]
+        11: return [[Vector2(x+0.5, y+1), Vector2(x+1, y+0.5)]]
+        12: return [[Vector2(x, y+0.5), Vector2(x+1, y+0.5)]]
+        13: return [[Vector2(x+0.5, y), Vector2(x+1, y+0.5)]]
+        14: return [[Vector2(x, y+0.5), Vector2(x+0.5, y)]]
+        _: return []
+
+func assemble_polygons(edge_list: Array) -> Array:
+    var adjacency = {}
+    for edge in edge_list:
+        var a = edge[0]
+        var b = edge[1]
+        var a_key = str(int(a.x*1000)) + "_" + str(int(a.y*1000))
+        var b_key = str(int(b.x*1000)) + "_" + str(int(b.y*1000))
+        
+        if not adjacency.has(a_key):
+            adjacency[a_key] = []
+        if not adjacency.has(b_key):
+            adjacency[b_key] = []
+            
+        adjacency[a_key].append(b)
+        adjacency[b_key].append(a)
+    
+    var visited_edges = {}
+    var polygons = []
+    
+    for key in adjacency.keys():
+        if adjacency[key].size() == 0:
+            continue
+            
+        for neighbor in adjacency[key]:
+            var edge_id = key + "_" + str(int(neighbor.x*1000)) + "_" + str(int(neighbor.y*1000))
+            if visited_edges.has(edge_id):
+                continue
+                
+            var chain = []
+            var start_key = key
+            var current_key = key
+            var next_point = neighbor
+            
+            while true:
+                var coords = current_key.split("_")
+                var cx = float(coords[0]) / 1000.0
+                var cy = float(coords[1]) / 1000.0
+                chain.append(Vector2(cx, cy))
+                
+                var edge_key = current_key + "_" + str(int(next_point.x*1000)) + "_" + str(int(next_point.y*1000))
+                visited_edges[edge_key] = true
+                
+                current_key = str(int(next_point.x*1000)) + "_" + str(int(next_point.y*1000))
+                if current_key == start_key:
+                    break
+                    
+                var found_next = false
+                for n in adjacency[current_key]:
+                    var n_key = str(int(n.x*1000)) + "_" + str(int(n.y*1000))
+                    var next_edge_key = current_key + "_" + n_key
+                    
+                    if not visited_edges.has(next_edge_key) or n_key == start_key:
+                        next_point = n
+                        found_next = true
+                        break
+                        
+                if not found_next:
+                    chain.append(next_point)
+                    break
+            
+            if chain.size() > 2:
+                polygons.append(chain)
+    
+    return polygons
+
+func get_polygon_area(polygon: Array) -> float:
+    var area = 0.0
+    var count = polygon.size()
+    for i in range(count):
+        var j = (i + 1) % count
+        area += polygon[i].x * polygon[j].y - polygon[j].x * polygon[i].y
+    return abs(area) * 0.5
+
+func simplify_polygon(points: Array, tolerance: float, depth: int = 0) -> Array:
+    if depth > 8:
+        return points
+    if points.size() < 3:
+        return points
+        
+    var dmax = 0.0
+    var index = 0
+    var end = points.size() - 1
+    
+    for i in range(1, end):
+        var dist_val = perpendicular_distance(points[i], points[0], points[end])
+        if dist_val > dmax:
+            index = i
+            dmax = dist_val
+            
+    if dmax > tolerance:
+        var left_segment = simplify_polygon(points.slice(0, index + 1), tolerance, depth + 1)
+        var right_segment = simplify_polygon(points.slice(index, points.size()), tolerance, depth + 1)
+        
+        var result = []
+        for p in left_segment:
+            result.append(p)
+        if result.size() > 0:
+            result.pop_back()
+        for p in right_segment:
+            result.append(p)
+            
+        return result
+    else:
+        return [points[0], points[end]]
+
+func perpendicular_distance(point: Vector2, line_start: Vector2, line_end: Vector2) -> float:
+    if line_start == line_end:
+        return point.distance_to(line_start)
+    var numerator = abs((line_end.y - line_start.y) * point.x - (line_end.x - line_start.x) * point.y + line_end.x * line_start.y - line_end.y * line_start.x)
+    var denominator = line_start.distance_to(line_end)
+    return numerator / (denominator if denominator != 0 else 0.00001)
 
 func _check_overlapping_bodies(area: Area2D) -> void:
     # Wait a physics frame to ensure bodies are properly detected
@@ -322,170 +499,6 @@ func _closest_point_on_segment(point: Vector2, line_start: Vector2, line_end: Ve
     var t = max(0, min(1, (point - line_start).dot(line_vector) / length_squared))
     return line_start + t * line_vector
 
-func create_collision_polygon_from_mask(mask_image: Image, box: Rect2) -> CollisionPolygon2D:
-    var downsample_factor = 4.0
-    var original_width = mask_image.get_width()
-    var original_height = mask_image.get_height()
-    var new_width = max(1, int(original_width / downsample_factor))
-    var new_height = max(1, int(original_height / downsample_factor))
-
-    mask_image.resize(new_width, new_height, Image.INTERPOLATE_NEAREST)
-
-    var width = mask_image.get_width()
-    var height = mask_image.get_height()
-    var binary = []
-
-    for y in range(height):
-        for x in range(width):
-            binary.append(1 if mask_image.get_pixel(x, y).a > 0 else 0)
-            
-    var start_point = null
-    for y in range(height):
-        for x in range(width):
-            var index = y * width + x
-            if binary[index] == 1:
-                var is_edge = false
-                for offset in [Vector2(-1, 0), Vector2(1, 0), Vector2(0, -1), Vector2(0, 1)]:
-                    var nx = x + int(offset.x)
-                    var ny = y + int(offset.y)
-                    if nx < 0 or nx >= width or ny < 0 or ny >= height or binary[ny * width + nx] == 0:
-                        is_edge = true
-                        break
-                if is_edge:
-                    start_point = Vector2(x, y)
-                    break
-        if start_point != null:
-            break
-
-    if start_point == null:
-        return CollisionPolygon2D.new()
-
-    var contour = [start_point]
-    var current = start_point
-    var current_direction = Vector2(1, 0)
-    var directions = [Vector2(1, 0), Vector2(1, 1), Vector2(0, 1), Vector2(-1, 1), Vector2(-1, 0), Vector2(-1, -1), Vector2(0, -1), Vector2(1, -1)]
-    var max_iterations = 10000
-    var iterations = 0
-
-    while iterations < max_iterations:
-        var found_next = false
-        var start_index = directions.find(current_direction)
-        if start_index == -1:
-            start_index = 0
-        var search_index = (start_index + 7) % 8
-        for i in range(8):
-            var direction_vector = directions[(search_index + i) % 8]
-            var next_point = current + direction_vector
-            var nx = int(next_point.x)
-            var ny = int(next_point.y)
-            if nx < 0 or nx >= width or ny < 0 or ny >= height:
-                continue
-            var neighbor_index = ny * width + nx
-            if binary[neighbor_index] == 1:
-                var is_edge = false
-                for offset in [Vector2(-1, 0), Vector2(1, 0), Vector2(0, -1), Vector2(0, 1)]:
-                    var check_x = nx + int(offset.x)
-                    var check_y = ny + int(offset.y)
-                    if check_x < 0 or check_x >= width or check_y < 0 or check_y >= height or binary[check_y * width + check_x] == 0:
-                        is_edge = true
-                        break
-                if is_edge:
-                    current = next_point
-                    current_direction = direction_vector
-                    if current == start_point:
-                        iterations = max_iterations
-                        found_next = false
-                        break
-                    contour.append(current)
-                    found_next = true
-                    break
-
-        if not found_next:
-            break
-
-        iterations += 1
-
-    var simplified_contour = simplify_polygon(contour, 1.0)
-    for i in range(simplified_contour.size()):
-        simplified_contour[i] *= downsample_factor
-
-    var collision_polygon = CollisionPolygon2D.new()
-    collision_polygon.polygon = simplified_contour
-    return collision_polygon
-
-func simplify_polygon(points: Array, tolerance: float) -> Array:
-    if points.size() < 3:
-        return points
-    var dmax = 0.0
-    var index = 0
-    for i in range(1, points.size() - 1):
-        var distance_value = perpendicular_distance(points[i], points[0], points[points.size() - 1])
-        if distance_value > dmax:
-            index = i
-            dmax = distance_value
-    if dmax > tolerance:
-        var left_segment = simplify_polygon(points.slice(0, index + 1), tolerance)
-        var right_segment = simplify_polygon(points.slice(index, points.size()), tolerance)
-        var result = left_segment.duplicate()
-        result.remove_at(result.size() - 1)
-        for point in right_segment:
-            result.append(point)
-        return result
-    else:
-        return [points[0], points[points.size() - 1]]
-
-func perpendicular_distance(point: Vector2, line_start: Vector2, line_end: Vector2) -> float:
-    if line_start == line_end:
-        return point.distance_to(line_start)
-    var numerator = abs((line_end.y - line_start.y) * point.x - (line_end.x - line_start.x) * point.y + line_end.x * line_start.y - line_end.y * line_start.x)
-    var denominator = line_start.distance_to(line_end)
-    return numerator / denominator
-
-func _draw() -> void:
-    if not camera_display.texture:
-        return
-        
-    for i in range(len(detection_boxes)):
-        var rect = detection_boxes[i]
-        var label = detection_labels[i]
-        
-        var class_id = label["class_id"]
-        var color = segmentation.get_class_color(class_id)
-        
-        var texture_size = camera_display.texture.get_size()
-        
-        var scaled_pos = Vector2(
-            rect.position.x * camera_display.scale.x,
-            rect.position.y * camera_display.scale.y
-        )
-        var scaled_size = Vector2(
-            rect.size.x * camera_display.scale.x,
-            rect.size.y * camera_display.scale.y
-        )
-        
-        var transformed_rect = Rect2(
-            camera_display.position + scaled_pos - (texture_size * camera_display.scale / 2),
-            scaled_size
-        )
-        
-        draw_rect(transformed_rect.grow(2), Color.BLACK, false, 5.0)
-        draw_rect(transformed_rect, color, false, 3.0)
-        
-        var font_size = 16
-        var label_text = label["class_name"] + " " + str(int(label["score"] * 100)) + "%"
-        var label_size = Vector2(label_text.length() * font_size * 0.6, font_size * 1.5)
-        var label_pos = transformed_rect.position - Vector2(0, label_size.y)
-        
-        if label_pos.x < 0:
-            label_pos.x = 0
-        if label_pos.y < 0:
-            label_pos.y = 0
-            
-        draw_rect(Rect2(label_pos, label_size).grow(2), Color.BLACK, true)
-        draw_rect(Rect2(label_pos, label_size), color, true)
-        
-        draw_string(ThemeDB.fallback_font, label_pos + Vector2(5, font_size), label_text, HORIZONTAL_ALIGNMENT_LEFT, -1, font_size, Color.WHITE)
-
 func _on_viewport_size_changed() -> void:
     viewport_size = get_viewport_rect().size
     _update_display_transform()
@@ -508,13 +521,3 @@ func _update_display_transform() -> void:
     for body in physics_bodies:
         if is_instance_valid(body):
             body.position = camera_display.position
-
-func get_class_name(class_id: int) -> String:
-    if class_id >= 0 and class_id < coco_classes.size():
-        return coco_classes[class_id]
-    return "Unknown (Class " + str(class_id) + ")"
-
-func _on_threshold_changed(value: float) -> void:
-    if segmentation and segmentation.is_ready():
-        segmentation.set_detection_threshold(value)
-        print("Detection threshold set to: " + str(value))

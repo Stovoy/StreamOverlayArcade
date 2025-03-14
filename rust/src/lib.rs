@@ -1,182 +1,74 @@
-use anyhow::Result;
 use godot::classes::image::Format;
-use godot::classes::{Image, ImageTexture, ResourceLoader};
+use godot::classes::{Image, ImageTexture};
 use godot::prelude::*;
-use image::{Rgb, RgbImage};
 use nokhwa::{
     pixel_format::RgbFormat,
     utils::{CameraFormat, CameraIndex, FrameFormat, RequestedFormat, RequestedFormatType},
     Camera,
 };
-use std::convert::TryFrom;
-use std::sync::Arc;
-use std::panic::{self, AssertUnwindSafe};
 
-use mediapipe_rs::tasks::vision::{ImageSegmenterBuilder, ImageSegmenter};
-use tokio::runtime::Runtime as TokioRuntime;
-
-mod python_bridge;
-use python_bridge::SelfieSelfSegmentation;
+use ndarray::Array3;
+use pyo3::prelude::*;
+use pyo3::types::{PyDict, PyList, PyTuple};
+use std::panic::AssertUnwindSafe;
+use std::panic;
 
 struct StreamOverlayArcadeRust;
 
 #[gdextension]
-unsafe impl ExtensionLibrary for StreamOverlayArcadeRust {}
+unsafe impl ExtensionLibrary for StreamOverlayArcadeRust {
+    fn on_level_init(level: InitLevel) {
+        if level == InitLevel::Scene {
+            godot_print!("Initializing Python interpreter for StreamOverlayArcade extension");
+            let _ = pyo3::prepare_freethreaded_python();
+        }
+    }
+}
 
 #[derive(GodotClass)]
 #[class(base = Node)]
 struct MediaPipeSegmentation {
     current_frame: Option<Gd<Image>>,
-    output_mask: Option<Gd<Image>>,
-    segmentation_masks: Vec<Gd<Image>>,
-    detection_scores: Vec<f32>,
-    detection_classes: Vec<i32>,
-    detection_boxes: Vec<Rect2i>,
-    runtime: Option<Arc<TokioRuntime>>,
     #[base]
     base: Base<Node>,
-    model_loaded: bool,
-    detection_threshold: f32,
-    input_width: i32,
-    input_height: i32,
-    class_colors: Vec<Color>,
-    segmenter: Option<ImageSegmenter>,
-    selfie_segmentation: Option<SelfieSelfSegmentation>,
+    py_segmentation: Option<Py<PyAny>>,
 }
 
 #[godot_api]
 impl INode for MediaPipeSegmentation {
     fn init(base: Base<Node>) -> Self {
-        let mut instance = Self {
+        let _ = pyo3::prepare_freethreaded_python();
+        
+        let py_segmentation = Python::with_gil(|py| {
+            match py.import_bound("python.segmentation") {
+                Ok(module) => {
+                    godot_print!("Segmentation initialized successfully");
+                    Some(module.into_py(py))
+                }
+                Err(err) => {
+                    godot_error!("Failed to initialize segmentation: {}", err);
+                    None
+                }
+            }
+        });
+        
+        Self {
             base,
             current_frame: None,
-            output_mask: None,
-            segmentation_masks: Vec::new(),
-            detection_scores: Vec::new(),
-            detection_classes: Vec::new(),
-            detection_boxes: Vec::new(),
-            runtime: None,
-            model_loaded: false,
-            detection_threshold: 0.5,
-            input_width: 550,
-            input_height: 550,
-            class_colors: Vec::new(),
-            segmenter: None,
-            selfie_segmentation: None,
-        };
-        
-        // Try to initialize selfie segmentation
-        match SelfieSelfSegmentation::new() {
-            Ok(segmentation) => {
-                instance.selfie_segmentation = Some(segmentation);
-                godot_print!("Selfie segmentation initialized during startup");
-            }
-            Err(err) => {
-                godot_error!("Failed to initialize selfie segmentation during startup: {}", err);
-            }
+            py_segmentation,
         }
-        
-        instance
+    }
+    
+    fn ready(&mut self) {
+        godot_print!("MediaPipeSegmentation is ready");
     }
 }
 
 #[godot_api]
 impl MediaPipeSegmentation {
     #[func]
-    fn load_model(&mut self, model_path: String) -> bool {
-        // Load the model path as a resource
-        let model_path_gstring: GString = model_path.into();
-        let mut resource_loader = ResourceLoader::singleton();
-        let resource = resource_loader.load(&model_path_gstring);
-
-        let model_resource = match resource {
-            Some(res) => res,
-            None => {
-                godot_error!(
-                    "Failed to load model resource from path: {}",
-                    model_path_gstring
-                );
-                return false;
-            }
-        };
-
-        // Setup class colors
-        self.class_colors = vec![];
-        for i in 0..256 {
-            let hue = (i * 7) % 360;
-            let h = hue as f32 / 360.0;
-            let s = 0.7;
-            let v = 0.9;
-
-            let c = v * s;
-            let x = c * (1.0 - ((h * 6.0) % 2.0 - 1.0).abs());
-            let m = v - c;
-
-            let (r, g, b) = if h < 1.0 / 6.0 {
-                (c, x, 0.0)
-            } else if h < 2.0 / 6.0 {
-                (x, c, 0.0)
-            } else if h < 3.0 / 6.0 {
-                (0.0, c, x)
-            } else if h < 4.0 / 6.0 {
-                (0.0, x, c)
-            } else if h < 5.0 / 6.0 {
-                (x, 0.0, c)
-            } else {
-                (c, 0.0, x)
-            };
-
-            let color = Color::from_rgb(r + m, g + m, b + m);
-            self.class_colors.push(color);
-        }
-        self.class_colors.push(Color::from_rgb(1.0, 0.0, 1.0));
-
-        // Get model data as bytes
-        let model_data = {
-            let data_variant = model_resource.get("data");
-            match data_variant.try_to::<PackedByteArray>() {
-                Ok(byte_array) => byte_array.to_vec(),
-                Err(_) => {
-                    godot_error!("Failed to get model data from resource");
-                    return false;
-                }
-            }
-        };
-
-        // Create a tokio runtime for async operations
-        let tokio_runtime = match tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .build() {
-                Ok(rt) => rt,
-                Err(e) => {
-                    godot_error!("Failed to create tokio runtime: {}", e);
-                    return false;
-                }
-            };
-            
-        self.runtime = Some(Arc::new(tokio_runtime));
-        
-        // Initialize MediaPipe segmenter
-        match ImageSegmenterBuilder::new()
-            .output_category_mask(true)
-            .output_confidence_masks(true)
-            .build_from_buffer(&model_data) {
-            Ok(segmenter) => {
-                self.segmenter = Some(segmenter);
-                self.model_loaded = true;
-                godot_print!("MediaPipe segmenter loaded successfully");
-                true
-            },
-            Err(e) => {
-                godot_error!("Failed to build MediaPipe segmenter: {}", e);
-                false
-            }
-        }
-    }
-
-    #[func]
     fn is_ready(&self) -> bool {
-        self.model_loaded
+        self.py_segmentation.is_some()
     }
 
     #[func]
@@ -185,374 +77,167 @@ impl MediaPipeSegmentation {
     }
 
     #[func]
-    fn get_output_mask(&self) -> Gd<Image> {
-        match &self.output_mask {
-            Some(mask) => mask.clone(),
-            None => {
-                if let Some(empty_mask) = Image::create(640, 480, false, Format::RGB8) {
-                    empty_mask
-                } else {
-                    godot_error!("Failed to create empty mask");
-                    Image::new_gd()
+    fn process_segmentation(&self) -> Dictionary {
+        let mut result_dict = Dictionary::new();
+        
+        if self.py_segmentation.is_none() {
+            godot_error!("Segmentation not initialized");
+            return result_dict;
+        }
+        
+        if let Some(image) = &self.current_frame {
+            // Create a copy of the image and convert to RGB8
+            let mut image_copy = image.clone();
+            image_copy.convert(Format::RGB8);
+            
+            // Get dimensions and data
+            let width = image_copy.get_width() as usize;
+            let height = image_copy.get_height() as usize;
+            let image_data = image_copy.get_data();
+            
+            // Convert the image data into ndarray format
+            let mut array = Array3::<u8>::zeros((height, width, 3));
+            let mut idx = 0;
+            
+            for y in 0..height {
+                for x in 0..width {
+                    if idx + 2 < image_data.len() {
+                        array[[y, x, 0]] = image_data[idx];
+                        array[[y, x, 1]] = image_data[idx + 1];
+                        array[[y, x, 2]] = image_data[idx + 2];
+                    }
+                    idx += 3;
                 }
             }
-        }
-    }
-
-    #[func]
-    fn process_all_objects(&mut self) -> bool {
-        if !self.is_ready() {
-            godot_error!("Model is not ready");
-            return false;
-        }
-
-        if let Some(image) = &self.current_frame {
-            let width = image.get_width();
-            let height = image.get_height();
-
-            let mut img_clone = image.clone();
-            img_clone.convert(Format::RGB8);
-            let image_data = img_clone.get_data();
-
-            match self.segment_with_mediapipe(image_data.as_slice(), width, height) {
-                Ok(_) => {
-                    return true;
+            
+            // Process the image with Python
+            let segmentation_result = Python::with_gil(|py| {
+                let segmentation = self.py_segmentation.as_ref().unwrap().bind(py);
+                
+                // Convert Rust array to numpy array
+                let image_array = numpy::PyArray::from_array_bound(py, &array);
+                
+                // Call the process_image function
+                match segmentation.call_method1("process_image", (image_array,)) {
+                    Ok(result) => {
+                        // Clone the result to extend its lifetime
+                        Some(result.into_py(py))
+                    },
+                    Err(err) => {
+                        godot_error!("Failed to call process_image: {}", err);
+                        None
+                    }
                 }
-                Err(e) => {
-                    godot_error!("Error processing frame: {}", e);
-                }
+            });
+            
+            if let Some(py_result) = segmentation_result {
+                Python::with_gil(|py| {
+                    // Extract results from Python
+                    let py_result = py_result.bind(py);
+                    if let Ok(tuple) = py_result.downcast::<PyTuple>() {
+                        if tuple.len() >= 4 {
+                            // Get the colored mask
+                            if let Ok(colored_mask_obj) = tuple.get_item(0) {
+                                if let Ok(colored_mask) = colored_mask_obj.extract::<&numpy::PyArray3<u8>>() {
+                                    let colored_mask_array = colored_mask.to_owned_array();
+                                    let mask_height = colored_mask_array.shape()[0];
+                                    let mask_width = colored_mask_array.shape()[1];
+                                    
+                                    // Create mask image
+                                    let mut mask_bytes = Vec::with_capacity(mask_height * mask_width * 4);
+                                    for y in 0..mask_height {
+                                        for x in 0..mask_width {
+                                            mask_bytes.push(colored_mask_array[[y, x, 0]]);
+                                            mask_bytes.push(colored_mask_array[[y, x, 1]]);
+                                            mask_bytes.push(colored_mask_array[[y, x, 2]]);
+                                            
+                                            let alpha = if colored_mask_array[[y, x, 0]] > 0 || 
+                                                          colored_mask_array[[y, x, 1]] > 0 || 
+                                                          colored_mask_array[[y, x, 2]] > 0 {
+                                                128
+                                            } else {
+                                                0
+                                            };
+                                            mask_bytes.push(alpha);
+                                        }
+                                    }
+                                    
+                                    let mut mask_image = Image::new_gd();
+                                    let byte_array = PackedByteArray::from(mask_bytes);
+                                    mask_image.set_data(
+                                        mask_width as i32, 
+                                        mask_height as i32, 
+                                        false,
+                                        Format::RGBA8, 
+                                        &byte_array
+                                    );
+                                    
+                                    result_dict.set("mask", mask_image);
+                                }
+                            }
+                            
+                            // Get category info
+                            if let Ok(category_info_obj) = tuple.get_item(3) {
+                                if let Ok(category_info) = category_info_obj.downcast::<PyList>() {
+                                    let mut detections = VariantArray::new();
+                                    
+                                    for i in 0..category_info.len() {
+                                        if let Ok(cat) = category_info.get_item(i) {
+                                            if let Ok(cat_dict) = cat.downcast::<PyDict>() {
+                                                let mut detection = Dictionary::new();
+                                                
+                                                if let (Ok(Some(id_item)), Ok(Some(name_item)), Ok(Some(color_item))) = (
+                                                    cat_dict.get_item("id"),
+                                                    cat_dict.get_item("name"),
+                                                    cat_dict.get_item("color")
+                                                ) {
+                                                    if let Ok(id) = id_item.extract::<u32>() {
+                                                        detection.set("class_id", id as i32);
+                                                        
+                                                        if let Ok(name) = name_item.extract::<String>() {
+                                                            detection.set("class_name", name);
+                                                        }
+                                                        
+                                                        if let Ok(color_tuple) = color_item.downcast::<PyTuple>() {
+                                                            if color_tuple.len() == 3 {
+                                                                if let (Ok(r), Ok(g), Ok(b)) = (
+                                                                    color_tuple.get_item(0).and_then(|v| v.extract::<u8>()),
+                                                                    color_tuple.get_item(1).and_then(|v| v.extract::<u8>()),
+                                                                    color_tuple.get_item(2).and_then(|v| v.extract::<u8>())
+                                                                ) {
+                                                                    detection.set("color", Color::from_rgb(
+                                                                        r as f32 / 255.0,
+                                                                        g as f32 / 255.0,
+                                                                        b as f32 / 255.0
+                                                                    ));
+                                                                }
+                                                            }
+                                                        }
+                                                        
+                                                        detection.set("score", 1.0);
+                                                        detections.push(&detection.to_variant());
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                    
+                                    result_dict.set("detections", detections);
+                                }
+                            }
+                        }
+                    }
+                });
             }
         } else {
             godot_error!("No current frame to process");
         }
 
-        false
-    }
-
-    #[func]
-    fn set_detection_threshold(&mut self, threshold: f32) -> bool {
-        if threshold >= 0.0 && threshold <= 1.0 {
-            self.detection_threshold = threshold;
-            return true;
-        } else {
-            godot_error!("Invalid threshold value. Must be between 0.0 and 1.0");
-            return false;
-        }
-    }
-
-    fn segment_with_mediapipe(&mut self, rgb_data: &[u8], width: i32, height: i32) -> Result<()> {
-        let expected_size = (width * height * 3) as usize;
-        if rgb_data.len() != expected_size {
-            godot_error!(
-                "Invalid RGB data size: got {}, expected {}",
-                rgb_data.len(),
-                expected_size
-            );
-            return Err(anyhow::anyhow!("Invalid RGB data size"));
-        }
-
-        // Check if the segmenter is available
-        if self.segmenter.is_none() {
-            return Err(anyhow::anyhow!("MediaPipe segmenter not initialized"));
-        }
-
-        // Convert image data to RGB image
-        let rgb_image = self.convert_to_rgb_image(rgb_data, width, height)?;
-        
-        // Process image with MediaPipe
-        let segment_result = self.segmenter.as_mut().unwrap().segment(&rgb_image)?;
-        
-        // Clear previous detections
-        self.detection_scores.clear();
-        self.detection_classes.clear();
-        self.detection_boxes.clear();
-        self.segmentation_masks.clear();
-        
-        // Process the category mask if available
-        if let Some(category_mask) = &segment_result.category_mask {
-            // Get dimensions
-            let mask_width = i32::try_from(category_mask.width()).unwrap_or(width);
-            let mask_height = i32::try_from(category_mask.height()).unwrap_or(height);
-            
-            // Create an RGB mask image
-            let mut mask_image = RgbImage::new(mask_width as u32, mask_height as u32);
-            
-            // Process each segment in the mask
-            for y in 0..mask_height as u32 {
-                for x in 0..mask_width as u32 {
-                    // Access the pixel directly - get_pixel returns a Luma<u8>
-                    let pixel = category_mask.get_pixel(x, y);
-                    let category = pixel[0]; // Get the u8 value from the Luma
-                    
-                    if category > 0 {
-                        // Use category value to look up the color
-                        let color_idx = category as usize % self.class_colors.len();
-                        let color = &self.class_colors[color_idx];
-                        
-                        let r = (color.r * 255.0) as u8;
-                        let g = (color.g * 255.0) as u8;
-                        let b = (color.b * 255.0) as u8;
-                        
-                        mask_image.put_pixel(x, y, Rgb([r, g, b]));
-                    } else {
-                        // Background
-                        mask_image.put_pixel(x, y, Rgb([0, 0, 0]));
-                    }
-                }
-            }
-            
-            // Create Godot image from mask
-            if let Ok(godot_mask) = self.create_single_godot_mask(&mask_image, mask_width, mask_height) {
-                self.segmentation_masks.push(godot_mask.clone());
-                
-                // Set combined mask
-                self.output_mask = Some(godot_mask);
-                
-                // Create detection info
-                self.detection_scores.push(1.0); // MediaPipe doesn't provide scores per category
-                self.detection_classes.push(1);  // Default class for now
-                
-                // Create bounding box (full image for now - could be calculated from mask)
-                let rect = Rect2i::new(
-                    Vector2i::new(0, 0),
-                    Vector2i::new(width, height)
-                );
-                self.detection_boxes.push(rect);
-            }
-        }
-        
-        Ok(())
-    }
-
-    fn convert_to_rgb_image(&self, rgb_data: &[u8], width: i32, height: i32) -> Result<RgbImage> {
-        let mut image = RgbImage::new(width as u32, height as u32);
-
-        for y in 0..height as u32 {
-            for x in 0..width as u32 {
-                let index = ((y * width as u32 + x) * 3) as usize;
-                let r = rgb_data[index];
-                let g = rgb_data[index + 1];
-                let b = rgb_data[index + 2];
-                image.put_pixel(x, y, Rgb([r, g, b]));
-            }
-        }
-
-        Ok(image)
-    }
-
-    fn create_godot_mask_from_image(
-        &mut self,
-        mask: &RgbImage,
-        width: i32,
-        height: i32,
-    ) -> Result<()> {
-        let mut godot_mask = match Image::create(width, height, false, Format::RGBA8) {
-            Some(img) => img,
-            None => {
-                godot_error!(
-                    "Failed to create Godot image with dimensions {}x{}",
-                    width,
-                    height
-                );
-                return Err(anyhow::anyhow!("Failed to create Godot image"));
-            }
-        };
-
-        let mut byte_array = PackedByteArray::new();
-        byte_array.resize((width * height * 4) as usize);
-
-        for y in 0..height as u32 {
-            for x in 0..width as u32 {
-                if x < mask.width() && y < mask.height() {
-                    let pixel = mask.get_pixel(x, y);
-                    let index = ((y as i32 * width + x as i32) * 4) as usize;
-
-                    let alpha = if pixel[0] > 0 || pixel[1] > 0 || pixel[2] > 0 {
-                        128
-                    } else {
-                        0
-                    };
-
-                    byte_array[index] = pixel[0];
-                    byte_array[index + 1] = pixel[1];
-                    byte_array[index + 2] = pixel[2];
-                    byte_array[index + 3] = alpha;
-                }
-            }
-        }
-
-        godot_mask.set_data(width, height, false, Format::RGBA8, &byte_array);
-        self.output_mask = Some(godot_mask);
-
-        Ok(())
-    }
-
-    fn create_single_godot_mask(
-        &self,
-        mask: &RgbImage,
-        width: i32,
-        height: i32,
-    ) -> Result<Gd<Image>> {
-        let mut godot_mask = match Image::create(width, height, false, Format::RGBA8) {
-            Some(img) => img,
-            None => {
-                return Err(anyhow::anyhow!("Failed to create Godot image"));
-            }
-        };
-
-        let mut byte_array = PackedByteArray::new();
-        byte_array.resize((width * height * 4) as usize);
-
-        for y in 0..height as u32 {
-            for x in 0..width as u32 {
-                if x < mask.width() && y < mask.height() {
-                    let pixel = mask.get_pixel(x, y);
-                    let index = ((y as i32 * width + x as i32) * 4) as usize;
-
-                    let alpha = if pixel[0] > 0 || pixel[1] > 0 || pixel[2] > 0 {
-                        128
-                    } else {
-                        0
-                    };
-
-                    byte_array[index] = pixel[0];
-                    byte_array[index + 1] = pixel[1];
-                    byte_array[index + 2] = pixel[2];
-                    byte_array[index + 3] = alpha;
-                }
-            }
-        }
-
-        godot_mask.set_data(width, height, false, Format::RGBA8, &byte_array);
-
-        Ok(godot_mask)
-    }
-
-    #[func]
-    fn get_segmentation_masks(&self) -> VariantArray {
-        let mut array = VariantArray::new();
-        for mask in &self.segmentation_masks {
-            array.push(&mask.clone().to_variant());
-        }
-        array
-    }
-
-    #[func]
-    fn get_combined_mask(&self) -> Gd<Image> {
-        self.get_output_mask()
-    }
-
-    #[func]
-    fn get_detection_scores(&self) -> PackedFloat32Array {
-        PackedFloat32Array::from(self.detection_scores.clone())
-    }
-
-    #[func]
-    fn get_detection_classes(&self) -> PackedInt32Array {
-        PackedInt32Array::from(self.detection_classes.clone())
-    }
-
-    #[func]
-    fn get_detection_boxes(&self) -> Array<Rect2i> {
-        let mut array = Array::new();
-        for rect in &self.detection_boxes {
-            array.push(*rect);
-        }
-        array
-    }
-
-    #[func]
-    fn get_class_color(&self, class_id: i32) -> Color {
-        if class_id < 0 || class_id as usize >= self.class_colors.len() {
-            return Color::from_rgb(1.0, 0.0, 1.0);
-        }
-        self.class_colors[class_id as usize]
-    }
-
-    #[func]
-    fn get_detection_count(&self) -> i32 {
-        self.detection_scores.len() as i32
-    }
-
-    #[func]
-    fn get_detection_at_index(&self, index: i32) -> Dictionary {
-        let mut dict = Dictionary::new();
-
-        if index < 0 || index as usize >= self.detection_scores.len() {
-            return dict;
-        }
-
-        let idx = index as usize;
-        dict.set("score", self.detection_scores[idx]);
-        dict.set("class_id", self.detection_classes[idx]);
-
-        if idx < self.detection_boxes.len() {
-            let rect = self.detection_boxes[idx];
-            dict.set("x", rect.position.x);
-            dict.set("y", rect.position.y);
-            dict.set("width", rect.size.x);
-            dict.set("height", rect.size.y);
-        }
-
-        if idx < self.segmentation_masks.len() {
-            dict.set("mask", self.segmentation_masks[idx].clone());
-        }
-
-        dict
-    }
-
-    #[func]
-    fn init_selfie_segmentation(&mut self) -> bool {
-        match SelfieSelfSegmentation::new() {
-            Ok(segmentation) => {
-                self.selfie_segmentation = Some(segmentation);
-                godot_print!("Selfie segmentation initialized successfully");
-                true
-            }
-            Err(err) => {
-                godot_error!("Failed to initialize selfie segmentation: {}", err);
-                false
-            }
-        }
-    }
-
-    #[func]
-    fn process_image_with_python(&mut self, image: Gd<Image>) -> Gd<Image> {
-        let selfie_segmentation = match &self.selfie_segmentation {
-            Some(segmentation) => segmentation,
-            None => {
-                godot_error!("Selfie segmentation not initialized");
-                return Image::new().upcast();
-            }
-        };
-
-        // Get image data
-        let mut image_ref = image.bind();
-        image_ref.convert(Format::FORMAT_RGB8);
-        
-        // Resize to 256x256 if needed
-        if image_ref.get_width() != 256 || image_ref.get_height() != 256 {
-            image_ref.resize(256, 256, Image::INTERPOLATE_BILINEAR);
-        }
-        
-        let image_data = image_ref.get_data();
-        
-        // Process the image
-        let mask_data = match selfie_segmentation.process_image(&image_data) {
-            Ok(data) => data,
-            Err(err) => {
-                godot_error!("Failed to process image: {}", err);
-                return Image::new().upcast();
-            }
-        };
-        
-        // Create a new image from the mask data
-        let mut mask_image = Image::new();
-        mask_image.set_data(256, 256, false, Format::FORMAT_L8, PackedByteArray::from(mask_data));
-        
-        mask_image.upcast()
+        result_dict
     }
 }
+
+
 
 #[derive(GodotClass)]
 #[class(base = Node)]

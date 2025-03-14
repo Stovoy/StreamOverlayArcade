@@ -10,16 +10,9 @@ crate-type = ["cdylib"]
 [dependencies]
 godot = { version = "0.2.4", features = ["experimental-wasm", "experimental-threads"] }
 nokhwa = { version = "0.10.7", features = ["input-native", "output-threaded"] }
-image = "0.25"
-anyhow = "1.0.76"
 ndarray = "0.15.6"
-mediapipe-rs = { version = "0.1.0-dev", git = "https://github.com/WasmEdge/mediapipe-rs" }
-tokio = { version = "1.32.0", features = ["full"] }
 pyo3 = { version = "0.21.0", features = ["extension-module"] }
 numpy = "0.21.0"
-
-[build-dependencies]
-cc = "1.0"
 
 [profile.release]
 debug = true
